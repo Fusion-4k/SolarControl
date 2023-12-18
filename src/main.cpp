@@ -4,24 +4,38 @@
 #include "thingProperties.h"
 #include <ezButton.h>
 #include <ESP32Encoder.h>
-// #include "myfunctions.h"
 
-/* =================== Version Changelog ===========================================================
+/* =================== Version Changelog ==============================================================
 
-// Version 1.1
-Seperate data pins for each temperature sensor
-Implementing LCD screen
-blinking status led
-rotary encoder button interaction
+    Version 1.1
+      Seperate data pins for each temperature sensor
+      Implementing LCD screen
+      blinking status led
+      rotary encoder button interaction
 
-// ==================== Settings =================================================================== */
+   ====================================================================================================
+*/
 
-#define TEMPERATURE_PRECISION 10 // Set float precision e.g. 10 == 0.25
+// ==================== Settings ===================================================================
 
-const int pinStatusLed = 27; // the number of the LED pin
+// Temperature sesnor precision e.g. 10 == 0.25
+#define TEMPERATURE_PRECISION 10
+
+// pins for each sensor
+const int sensorTempIn = 18;
+const int sensorTempOut = 19;
+const int sensorTempPool = 23;
+const int sensorPressure = 35;
+
+// pins for the rotary encoder
 const int pinRotarySW = 33;
 const int pinRotaryCLK = 26;
 const int pinRotaryDT = 25;
+
+// pin for status led
+const int pinStatusLed = 27; // the number of the LED pin
+
+// =================================================================================================
 
 // Array of OneWires for TemperatureIn, TemperatureOut, TemperaturePool
 OneWire Wires[] = {OneWire(18), OneWire(19), OneWire(23)};
@@ -29,28 +43,34 @@ OneWire Wires[] = {OneWire(18), OneWire(19), OneWire(23)};
 // Array of DallasTemperature sensors for TemperatureIn, TemperatureOut, TemperaturePool
 DallasTemperature sensorsTemperature[] = {DallasTemperature(&Wires[0]), DallasTemperature(&Wires[1]), DallasTemperature(&Wires[2])};
 
-const int sensorPressure = 35;
-
-float ReadingsMatrix[4][3];         // measurements for each sensor Current/Min/Max
-LiquidCrystal_I2C lcd(0x27, 20, 4); // set the LCD address to 0x27 for a 20 chars and 4 line display
+//
+float ReadingsMatrix[4][3]; // measurements for each sensor Current/Min/Max
 
 int ledState = LOW;
 unsigned long prevMillisStatusOn = 0; // will store last time LED was updated
 unsigned long prevMillisStatusOff = 0;
 unsigned long prevMillisLcdRefresh = 0; // will store last time LED was updated
+unsigned long prevMillisMain = 0;
+unsigned long prevMillisTemp = 0;
 
 const long intervalStatusOn = 250; // interval at which to blink (milliseconds)
 const long intervalStatusOff = 10000;
 const long intervalLcdRefresh = 1000;
+const long intervalMain = 1000;
 
 // Menu skipping
 volatile int buttonState = 0;
 volatile int displayOn = 0;
+volatile bool rotaryEncoder = false;
 
 volatile long unsigned int lastMillis = 0;
 volatile long unsigned int currentMillis = 0;
 volatile long unsigned int lastMillisLCDOn = 0;
 volatile int displayActive = 0;
+
+long int intervalTemp = 750 / (1 << (12 - TEMPERATURE_PRECISION));
+
+LiquidCrystal_I2C lcd(0x27, 20, 4); // set the LCD address to 0x27 for a 20 chars and 4 line display
 
 // Threshold matrix with layout {defect, min, max}:   {{-255, 0, 100}, ...}
 float LimitMatrix[4][3] = {
@@ -72,30 +92,10 @@ ezButton button(pinRotarySW);
 
 // =================================================================================================
 
-void setup()
+// Interrupt routine just sets a flag when rotation is detected
+void IRAM_ATTR rotary()
 {
-  button.setDebounceTime(50);
-
-  // initialize temperature sensors
-  for (int i = 0; i < 3; i++)
-    sensorsTemperature[i].begin();
-  // initialize the lcd
-  lcd.init();
-  lcd.noBacklight();
-
-  pinMode(pinStatusLed, OUTPUT);
-  pinMode(pinRotarySW, INPUT);
-
-  Serial.begin(115200);
-  delay(1000);
-  // Setup Arduino IoT Cloud
-  initProperties();
-  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
-  setDebugMessageLevel(2);
-  ArduinoCloud.printDebugInfo();
-
-  for (int i = 0; i < 3; i++)
-    sensorsTemperature[i].setResolution(TEMPERATURE_PRECISION);
+  rotaryEncoder = true;
 }
 
 // Round Float to specified decimal places
@@ -124,8 +124,7 @@ float readPressureSensor(int pin)
   return convpressure;
 }
 
-// Update all sensor readings including minimum and maximum values
-void updateReadings()
+void readSensors()
 {
   for (int i = 0; i < 3; i++)
   {
@@ -133,6 +132,27 @@ void updateReadings()
   }
 
   ReadingsMatrix[3][0] = readPressureSensor(sensorPressure);
+}
+
+// read sensors and fill min/max readings with current readings
+void initReadings()
+{
+  readSensors();
+
+  for (int i = 0; i < 4; i++)
+  {
+    for (int k = 1; k < 3; k++)
+    {
+      ReadingsMatrix[i][k] = ReadingsMatrix[i][0];
+    }
+  }
+}
+
+// Update all sensor readings including minimum and maximum values
+void updateReadings()
+{
+
+  readSensors();
 
   for (int i = 0; i < 4; i++)
   {
@@ -141,6 +161,46 @@ void updateReadings()
     if (ReadingsMatrix[i][0] > ReadingsMatrix[i][2])
       ReadingsMatrix[i][2] = ReadingsMatrix[i][0]; // update maximum if necessary
   }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  attachInterrupt(digitalPinToInterrupt(pinRotaryCLK), rotary, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinRotaryDT), rotary, CHANGE);
+
+  // initialize the temperature sensors
+  for (int i = 0; i < 3; i++)
+  {
+    sensorsTemperature[i].begin();
+    sensorsTemperature[i].setResolution(TEMPERATURE_PRECISION);
+    sensorsTemperature[i].setWaitForConversion(false);
+    sensorsTemperature[i].requestTemperatures();
+  }
+
+  // Wait for Temperature request
+  delay(1000);
+
+  // initialize the lcd display
+  lcd.init();
+  lcd.noBacklight();
+
+  // set debounce time for the rotay switch
+  // button.setDebounceTime(50);
+
+  // set the status led pin as output
+  pinMode(pinStatusLed, OUTPUT);
+  pinMode(pinRotaryCLK, INPUT);
+  pinMode(pinRotaryDT, INPUT);
+
+  // Setup Arduino IoT Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+  initReadings();
+  prevMillisTemp = millis();
 }
 
 // Check each Sensor for new Defect, Min and Max Error; defect values are -255 and below
@@ -229,118 +289,199 @@ void onWarningChange()
     ResetErrors(); */
 }
 
-void ReadingsInit()
+int rotationCounter = 200;
+
+int8_t checkRotaryEncoder()
 {
+  // Reset the flag that brought us here (from ISR)
+  rotaryEncoder = false;
+
+  static uint8_t lrmem = 3;
+  static int lrsum = 0;
+  static int8_t TRANS[] = {0, -1, 1, 14, 1, 0, 14, -1, -1, 14, 0, 1, 14, 1, -1, 0};
+
+  // Read BOTH pin states to deterimine validity of rotation (ie not just switch bounce)
+  int8_t l = digitalRead(pinRotaryCLK);
+  int8_t r = digitalRead(pinRotaryDT);
+
+  // Move previous value 2 bits to the left and add in our new values
+  lrmem = ((lrmem & 0x03) << 2) + 2 * l + r;
+
+  // Convert the bit pattern to a movement indicator (14 = impossible, ie switch bounce)
+  lrsum += TRANS[lrmem];
+
+  /* encoder not in the neutral (detent) state */
+  if (lrsum % 4 != 0)
+  {
+    return 0;
+  }
+
+  /* encoder in the neutral state - clockwise rotation*/
+  if (lrsum == 4)
+  {
+    lrsum = 0;
+    return 1;
+  }
+
+  /* encoder in the neutral state - anti-clockwise rotation*/
+  if (lrsum == -4)
+  {
+    lrsum = 0;
+    return -1;
+  }
+
+  // An impossible rotation has been detected - ignore the movement
+  lrsum = 0;
+  return 0;
 }
 
 void loop()
 {
-  button.loop();
-  ArduinoCloud.update();
-  for (int i = 0; i < 3; i++)
-    sensorsTemperature[i].requestTemperatures();
-
-  delay(100);
-
-  updateReadings();
-
-  // Upload readings to IoT Cloud ------------------------------------------------------------------------------
-  temperatureIn = ReadingsMatrix[0][0];
-  temperatureOut = ReadingsMatrix[1][0];
-  temperaturePool = ReadingsMatrix[2][0];
-  pressure = ReadingsMatrix[3][0];
-
-  // Show data on lcd ------------------------------------------------------------------------------------------
   currentMillis = millis();
 
-  if (button.isPressed())
+  if (rotaryEncoder)
   {
-    if (buttonState > 2)
-      buttonState = 0;
-    buttonState++;
-    Serial.println(buttonState);
-    lcd.backlight();
-    lcd.display();
-    // lcd.clear();
-    displayActive = 1;
-    displayOn = 0;
-    lastMillisLCDOn = currentMillis;
-  }
+    // Get the movement (if valid)
+    int8_t rotationValue = checkRotaryEncoder();
 
-  if (displayActive == 1 && (currentMillis - lastMillisLCDOn >= 60000))
-  {
-    Serial.println("Turned off Display");
-    lcd.noBacklight();
-    lcd.noDisplay();
-    displayActive = 0;
-    buttonState = 0;
-  }
-
-  if (displayActive)
-  {
-    if (currentMillis - prevMillisLcdRefresh >= intervalLcdRefresh)
+    // If valid movement, do something
+    if (rotationValue != 0)
     {
-      if (buttonState == 1)
-      {
-        // lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print(String("Druck: ") + String(ReadingsMatrix[3][0], 2) + String(" bar "));
-        lcd.setCursor(17, 0);
-        lcd.print("Now");
-
-        lcd.setCursor(0, 1);
-        lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][0], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 2);
-        lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][0], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 3);
-        lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][0], 1) + (char)223 + String("C "));
-
-        prevMillisLcdRefresh = currentMillis;
-      }
-
-      if (buttonState == 2)
-      {
-        // lcd.clear();
-        Serial.println("Page2");
-        lcd.setCursor(0, 0);
-        lcd.print(String("Druck: ") + String(ReadingsMatrix[3][1], 2) + String(" bar "));
-        lcd.setCursor(17, 0);
-        lcd.print("Min");
-
-        lcd.setCursor(0, 1);
-        lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][1], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 2);
-        lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][1], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 3);
-        lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][1], 1) + (char)223 + String("C "));
-
-        prevMillisLcdRefresh = currentMillis;
-      }
-      if (buttonState == 3)
-      {
-        // lcd.clear();
-        Serial.println("Page3");
-        lcd.setCursor(0, 0);
-        lcd.print(String("Druck: ") + String(ReadingsMatrix[3][2], 2) + String(" bar "));
-        lcd.setCursor(17, 0);
-        lcd.print("Max");
-        lcd.setCursor(0, 1);
-        lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][2], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 2);
-        lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][2], 1) + (char)223 + String("C "));
-
-        lcd.setCursor(0, 3);
-        lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][2], 1) + (char)223 + String("C "));
-
-        prevMillisLcdRefresh = currentMillis;
-      }
+      rotationCounter += rotationValue;
+      Serial.print(rotationValue < 1 ? "L" : "R");
+      
+      if(rotationCounter > 5) rotationCounter = 1;
+      if(rotationCounter == 0) rotationCounter = 4;
+      Serial.println(rotationCounter);
     }
   }
+
+  if (currentMillis - prevMillisTemp >= 1000)
+  {
+    updateReadings();
+    for (int i = 0; i < 3; i++)
+      sensorsTemperature[i].requestTemperatures();
+    prevMillisTemp = currentMillis;
+    Serial.println(ReadingsMatrix[0][0]);
+
+    temperatureIn = ReadingsMatrix[0][0];
+    temperatureOut = ReadingsMatrix[1][0];
+    temperaturePool = ReadingsMatrix[2][0];
+    pressure = ReadingsMatrix[3][0];
+    ArduinoCloud.update();
+  }
+
+  /*
+    currentMillis = millis();
+    if (currentMillis - prevMillisMain >= intervalMain)
+    {
+      for (int i = 0; i < 3; i++)
+        sensorsTemperature[i].requestTemperatures();
+      updateReadings();
+
+
+      prevMillisMain = currentMillis;
+      Serial.println("Loop ended");
+    }
+    /*
+      // Upload readings to IoT Cloud ------------------------------------------------------------------------------
+      temperatureIn = ReadingsMatrix[0][0];
+      temperatureOut = ReadingsMatrix[1][0];
+      temperaturePool = ReadingsMatrix[2][0];
+      pressure = ReadingsMatrix[3][0];
+
+      // Show data on lcd ------------------------------------------------------------------------------------------
+      currentMillis = millis();
+
+      if (button.isPressed())
+      {
+        Serial.println("Button Pressed");
+        if (buttonState > 2)
+          buttonState = 0;
+        buttonState++;
+        Serial.println(buttonState);
+        lcd.backlight();
+        lcd.display();
+        // lcd.clear();
+        displayActive = 1;
+        displayOn = 0;
+        lastMillisLCDOn = currentMillis;
+      }
+
+      if (displayActive == 1 && (currentMillis - lastMillisLCDOn >= 60000))
+      {
+        Serial.println("Turned off Display");
+        lcd.noBacklight();
+        lcd.noDisplay();
+        displayActive = 0;
+        buttonState = 0;
+      }
+
+      if (displayActive)
+      {
+        if (currentMillis - prevMillisLcdRefresh >= intervalLcdRefresh)
+        {
+          if (buttonState == 1)
+          {
+            // lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][0], 2) + String(" bar "));
+            lcd.setCursor(17, 0);
+            lcd.print("Now");
+
+            lcd.setCursor(0, 1);
+            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][0], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 2);
+            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][0], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 3);
+            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][0], 1) + (char)223 + String("C "));
+
+            prevMillisLcdRefresh = currentMillis;
+          }
+
+          if (buttonState == 2)
+          {
+            // lcd.clear();
+            Serial.println("Page2");
+            lcd.setCursor(0, 0);
+            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][1], 2) + String(" bar "));
+            lcd.setCursor(17, 0);
+            lcd.print("Min");
+
+            lcd.setCursor(0, 1);
+            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][1], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 2);
+            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][1], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 3);
+            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][1], 1) + (char)223 + String("C "));
+
+            prevMillisLcdRefresh = currentMillis;
+          }
+          if (buttonState == 3)
+          {
+            // lcd.clear();
+            Serial.println("Page3");
+            lcd.setCursor(0, 0);
+            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][2], 2) + String(" bar "));
+            lcd.setCursor(17, 0);
+            lcd.print("Max");
+            lcd.setCursor(0, 1);
+            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][2], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 2);
+            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][2], 1) + (char)223 + String("C "));
+
+            lcd.setCursor(0, 3);
+            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][2], 1) + (char)223 + String("C "));
+
+            prevMillisLcdRefresh = currentMillis;
+          }
+        }
+      } */
 
   if (currentMillis - prevMillisStatusOff >= intervalStatusOff && ledState == LOW)
   {
