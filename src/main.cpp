@@ -22,15 +22,15 @@
 #define TEMPERATURE_PRECISION 10
 
 // pins for each sensor
-const int sensorTempIn = 18;
-const int sensorTempOut = 19;
-const int sensorTempPool = 23;
+const int sensorTempIn = 25;
+const int sensorTempOut = 33;
+const int sensorTempPool = 32;
 const int sensorPressure = 35;
 
 // pins for the rotary encoder
-const int pinRotarySW = 33;
-const int pinRotaryCLK = 26;
-const int pinRotaryDT = 25;
+const int pinRotarySW = 36;
+const int pinRotaryCLK = 34;
+const int pinRotaryDT = 39;
 
 // pin for status led
 const int pinStatusLed = 27; // the number of the LED pin
@@ -38,13 +38,29 @@ const int pinStatusLed = 27; // the number of the LED pin
 // =================================================================================================
 
 // Array of OneWires for TemperatureIn, TemperatureOut, TemperaturePool
-OneWire Wires[] = {OneWire(18), OneWire(19), OneWire(23)};
+OneWire Wires[] = {OneWire(sensorTempIn), OneWire(sensorTempOut), OneWire(sensorTempPool)};
 
 // Array of DallasTemperature sensors for TemperatureIn, TemperatureOut, TemperaturePool
 DallasTemperature sensorsTemperature[] = {DallasTemperature(&Wires[0]), DallasTemperature(&Wires[1]), DallasTemperature(&Wires[2])};
 
-//
-float ReadingsMatrix[4][3]; // measurements for each sensor Current/Min/Max
+// Measurements for each sensor Current/Min/Max
+float ReadingsMatrix[4][3];
+
+// Threshold matrix with layout {min, max}:   {{0, 100}, ...}
+float LimitMatrix[4][3] = {
+    {-255, 0, 40},
+    {-255, 0, 85},
+    {-255, 0, 95},
+    {-255, 0.5, 3.5}};
+
+// Names for each sensor; used for warning messages:  {"Sensor1", ...}
+String SensorNames[4] = {
+    "Kaltwassersensor",
+    "Heizwassersensor",
+    "Poolwassersensor",
+    "Drucksensor"};
+
+bool ErrorMatrix[4][3]; // {defect, min, max} for each sensor
 
 int ledState = LOW;
 unsigned long prevMillisStatusOn = 0; // will store last time LED was updated
@@ -53,9 +69,13 @@ unsigned long prevMillisLcdRefresh = 0; // will store last time LED was updated
 unsigned long prevMillisMain = 0;
 unsigned long prevMillisTemp = 0;
 
-const long intervalStatusOn = 250; // interval at which to blink (milliseconds)
-const long intervalStatusOff = 10000;
-const long intervalLcdRefresh = 1000;
+unsigned long start;
+unsigned long end;
+bool ErrorState;
+
+long intervalStatusOn = 250; // interval at which to blink (milliseconds)
+long intervalStatusOff = 10000;
+const long intervalLcdRefresh = 2500;
 const long intervalMain = 1000;
 
 // Menu skipping
@@ -66,27 +86,12 @@ volatile bool rotaryEncoder = false;
 volatile long unsigned int lastMillis = 0;
 volatile long unsigned int currentMillis = 0;
 volatile long unsigned int lastMillisLCDOn = 0;
-volatile int displayActive = 0;
+volatile int TurnOnDisplay = 0;
 
-long int intervalTemp = 750 / (1 << (12 - TEMPERATURE_PRECISION));
+long int intervalTemp = 750 / (1 << (12 - TEMPERATURE_PRECISION)); // TemperatureConversionTime
+int rotationCounter = 0;
 
 LiquidCrystal_I2C lcd(0x27, 20, 4); // set the LCD address to 0x27 for a 20 chars and 4 line display
-
-// Threshold matrix with layout {defect, min, max}:   {{-255, 0, 100}, ...}
-float LimitMatrix[4][3] = {
-    {-255, 0, 40},
-    {-255, 0, 85},
-    {-255, 0, 85},
-    {-255, 1.5, 2.5}};
-
-// Names for each sensor; used for warning messages:  {"Sensor1", ...}
-String SensorNames[4] = {
-    "Kaltwasser",
-    "Heizwasser",
-    "Poolwasser",
-    "Allgemein"};
-
-bool ErrorMatrix[4][3]; // {defect, min, max} for each sensor
 
 ezButton button(pinRotarySW);
 
@@ -118,10 +123,10 @@ float readTemperatureSensor(DallasTemperature *sensor)
 float readPressureSensor(int pin)
 {
   float analogReading = analogRead(pin);
-  if (analogReading <= 0)
-    return -255; // set pressure to -255 if device is defect
-  float convpressure = roundFloat((analogReading - 380) / 620, 2);
-  return convpressure;
+  if (analogReading < 400)
+    return -255;                                                   // set pressure to -255 if device is defect
+  float convPressure = roundFloat((analogReading - 400) / 510, 2); // 1k/2k-pcb: roundFloat((analogReading - 485) / 745, 2)
+  return convPressure;
 }
 
 void readSensors()
@@ -151,145 +156,109 @@ void initReadings()
 // Update all sensor readings including minimum and maximum values
 void updateReadings()
 {
-
   readSensors();
 
   for (int i = 0; i < 4; i++)
   {
-    if (ReadingsMatrix[i][0] < ReadingsMatrix[i][1])
-      ReadingsMatrix[i][1] = ReadingsMatrix[i][0]; // update minimum if necessary
-    if (ReadingsMatrix[i][0] > ReadingsMatrix[i][2])
-      ReadingsMatrix[i][2] = ReadingsMatrix[i][0]; // update maximum if necessary
+    // update minimum if necessary
+    if (ReadingsMatrix[i][0] < ReadingsMatrix[i][1] && ReadingsMatrix[i][0] != LimitMatrix[i][0])
+      ReadingsMatrix[i][1] = ReadingsMatrix[i][0];
+
+    // update maximum if necessary
+    if (ReadingsMatrix[i][0] > ReadingsMatrix[i][2] && ReadingsMatrix[i][0] != LimitMatrix[i][0])
+      ReadingsMatrix[i][2] = ReadingsMatrix[i][0];
   }
 }
 
-void setup()
+// Check each Sensor for new Defect, Min and Max Error; defect values are -255; return true if new error occurred
+bool UpdateErrors()
 {
-  Serial.begin(115200);
-
-  attachInterrupt(digitalPinToInterrupt(pinRotaryCLK), rotary, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(pinRotaryDT), rotary, CHANGE);
-
-  // initialize the temperature sensors
-  for (int i = 0; i < 3; i++)
-  {
-    sensorsTemperature[i].begin();
-    sensorsTemperature[i].setResolution(TEMPERATURE_PRECISION);
-    sensorsTemperature[i].setWaitForConversion(false);
-    sensorsTemperature[i].requestTemperatures();
-  }
-
-  // Wait for Temperature request
-  delay(1000);
-
-  // initialize the lcd display
-  lcd.init();
-  lcd.noBacklight();
-
-  // set debounce time for the rotay switch
-  // button.setDebounceTime(50);
-
-  // set the status led pin as output
-  pinMode(pinStatusLed, OUTPUT);
-  pinMode(pinRotaryCLK, INPUT);
-  pinMode(pinRotaryDT, INPUT);
-
-  // Setup Arduino IoT Cloud
-  initProperties();
-  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
-  setDebugMessageLevel(2);
-  ArduinoCloud.printDebugInfo();
-  initReadings();
-  prevMillisTemp = millis();
-}
-
-// Check each Sensor for new Defect, Min and Max Error; defect values are -255 and below
-bool CheckErrors()
-{
-  bool result = false;
+  bool newError = false;
 
   for (int i = 0; i < 4; i++)
   {
-    if (!ErrorMatrix[i][0] && ReadingsMatrix[i][0] == LimitMatrix[i][0])
-    { // Check for new defect
-      ErrorMatrix[i][0] = true;
-      result = true;
-    }
-    if (!ErrorMatrix[i][1] && ReadingsMatrix[i][0] <= LimitMatrix[i][1] && ReadingsMatrix[i][0] > LimitMatrix[i][0])
+    if (ReadingsMatrix[i][0] == LimitMatrix[i][0])
     {
-      ErrorMatrix[i][1] = true;
-      result = true;
+      if (!ErrorMatrix[i][0])
+      {
+        ErrorMatrix[i][0] = true;
+        newError = true;
+      }
     }
-    if (!ErrorMatrix[i][2] && ReadingsMatrix[i][0] >= LimitMatrix[i][2])
-    { // Check for reaching maximum value
-      ErrorMatrix[i][2] = true;
-      result = true;
+    else
+    {
+      if (!ErrorMatrix[i][1] && ReadingsMatrix[i][0] <= LimitMatrix[i][1])
+      {
+        ErrorMatrix[i][1] = true;
+        newError = true;
+      }
+
+      if (!ErrorMatrix[i][2] && ReadingsMatrix[i][0] >= LimitMatrix[i][2])
+      {
+        ErrorMatrix[i][2] = true;
+        newError = true;
+      }
     }
   }
-  // if (result)
-  // state = false;
-  return result;
+
+  return newError;
 }
 
-/*
+// Set all errors to false
+void ResetErrors()
+{
+  for (int i = 0; i < 4; i++)
+  {
+    for (int k = 1; k < 3; k++)
+    {
+      ErrorMatrix[i][k] = false;
+    }
+  }
+  warning = "Fehlermeldungen zurückgesetzt";
+  ErrorState = 0;
+  initReadings();
+}
+
 // Creates a Warning-Message with Information for all sensors
 void CreateMessage()
 {
   String Message = "Fehler protokolliert:\n";
-  String Einheiten[] = {" °C", " bar"};
   String Einheit;
 
-  for (int i = 0; i < TEMPSENSOR_COUNT + PRESSURESENSOR_COUNT; i++)
+  for (int i = 0; i < 4; i++)
   {
     if (ErrorMatrix[i][0] || ErrorMatrix[i][1] || ErrorMatrix[i][2])
     {
-      if (i < TEMPSENSOR_COUNT)
+      if (i < 3)
       {
-        // Message += "Temperatursensor-" + (i + 1);
-        Message += "Temperatursensor-" + SensorNames[i] + ":";
-        Einheit = Einheiten[0];
+        Message += "\n\n" + SensorNames[i] + ":";
+        Einheit = " °C";
       }
       else
       {
-        Message += "Drucksensor-" + SensorNames[i] + ":";
-        Einheit = Einheiten[0];
+        Message += "\n\n" + SensorNames[i] + ":";
+        Einheit = " bar";
       }
 
       if (ErrorMatrix[i][0])
         Message += "\n - defekt";
       if (ErrorMatrix[i][1])
-        Message += "\n - Minimalwert (" + String(LimitMatrix[i][1], 1) + Einheit + ") unterschritten";
+        Message += "\n - Minimalwert mit " + String(ReadingsMatrix[i][1], 2) + Einheit + " unterschritten";
       if (ErrorMatrix[i][2])
-        Message += "\n - Maximalwert (" + String(LimitMatrix[i][1], 1) + Einheit + ") überschritten";
-
-      Message += "\n\n";
+        Message += "\n - Maximalwert mit " + String(ReadingsMatrix[i][2], 2) + Einheit + " überschritten";
     }
   }
   warning = Message;
   // onWarningChange(); //Aufruf nötig?
 }
 
-// Resets warning
-void ResetErrors()
-{
-  for (int i = 0; i < TEMPSENSOR_COUNT + PRESSURESENSOR_COUNT; i++)
-  {
-    for (int k = 0; k < 3; k++)
-    {
-      ErrorMatrix[i][k] = false;
-    }
-  }
-  state = true;
-  warning = "Fehlermeldungen zurückgesetzt";
-} */
-
 void onWarningChange()
 {
-  /* if (warning == "Reset")
-    ResetErrors(); */
+  Serial.println("Changed Text to");
+  Serial.println(warning);
+  if (warning == "Reset")
+    ResetErrors();
 }
-
-int rotationCounter = 200;
 
 int8_t checkRotaryEncoder()
 {
@@ -335,10 +304,78 @@ int8_t checkRotaryEncoder()
   return 0;
 }
 
+void setup()
+{
+  Serial.begin(115200);
+
+  attachInterrupt(digitalPinToInterrupt(pinRotaryCLK), rotary, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinRotaryDT), rotary, CHANGE);
+
+  // initialize the temperature sensors
+  for (int i = 0; i < 3; i++)
+  {
+    sensorsTemperature[i].begin();
+    sensorsTemperature[i].setResolution(TEMPERATURE_PRECISION);
+    sensorsTemperature[i].setWaitForConversion(false);
+    sensorsTemperature[i].requestTemperatures();
+  }
+
+  // Wait for Temperature request
+  delay(1000);
+
+  // initialize the lcd display
+  lcd.init();
+  lcd.noBacklight();
+
+  // set debounce time for the rotay switch
+  // button.setDebounceTime(50);
+
+  // set the status led pin as output
+  pinMode(pinStatusLed, OUTPUT);
+  pinMode(pinRotaryCLK, INPUT);
+  pinMode(pinRotaryDT, INPUT);
+
+  // Setup Arduino IoT Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+  initReadings();
+  prevMillisTemp = millis();
+}
+
 void loop()
 {
-  currentMillis = millis();
+  // Update sensor readings
+  // ====================================================================================================
+  if (millis() - prevMillisTemp >= 2500 && millis() - prevMillisTemp >= intervalTemp)
+  {
+    updateReadings();
+    for (int i = 0; i < 3; i++)
+      sensorsTemperature[i].requestTemperatures();
+    prevMillisTemp = millis();
 
+    // Upload readings to IoT Cloud
+    temperatureIn = ReadingsMatrix[0][0];
+    temperatureOut = ReadingsMatrix[1][0];
+    temperaturePool = ReadingsMatrix[2][0];
+    pressure = ReadingsMatrix[3][0];
+    ArduinoCloud.update();
+
+    for (int i = 0; i < 4; i++)
+    {
+      for (int k = 0; k < 3; k++)
+      {
+        Serial.print(ErrorMatrix[i][k]);
+        Serial.print(" ");
+      }
+      Serial.println();
+    }
+  }
+  // ====================================================================================================
+
+  // check for rotary encoder rotation
+  // ====================================================================================================
   if (rotaryEncoder)
   {
     // Get the movement (if valid)
@@ -348,158 +385,122 @@ void loop()
     if (rotationValue != 0)
     {
       rotationCounter += rotationValue;
-      Serial.print(rotationValue < 1 ? "L" : "R");
-      
-      if(rotationCounter > 5) rotationCounter = 1;
-      if(rotationCounter == 0) rotationCounter = 4;
-      Serial.println(rotationCounter);
+      lcd.backlight();
+      lcd.display();
+      TurnOnDisplay = 1;
+      lastMillisLCDOn = millis();
+      prevMillisLcdRefresh = prevMillisLcdRefresh - intervalLcdRefresh;
     }
   }
+  // ====================================================================================================
 
-  if (currentMillis - prevMillisTemp >= 1000)
+  // Turn off display after 60s without input
+  if (TurnOnDisplay == 1 && (millis() - lastMillisLCDOn >= 60000))
   {
-    updateReadings();
-    for (int i = 0; i < 3; i++)
-      sensorsTemperature[i].requestTemperatures();
-    prevMillisTemp = currentMillis;
-    Serial.println(ReadingsMatrix[0][0]);
-
-    temperatureIn = ReadingsMatrix[0][0];
-    temperatureOut = ReadingsMatrix[1][0];
-    temperaturePool = ReadingsMatrix[2][0];
-    pressure = ReadingsMatrix[3][0];
-    ArduinoCloud.update();
+    lcd.noBacklight();
+    lcd.noDisplay();
+    TurnOnDisplay = 0;
+    rotationCounter = 0;
   }
 
-  /*
-    currentMillis = millis();
-    if (currentMillis - prevMillisMain >= intervalMain)
+  if (TurnOnDisplay && (millis() - prevMillisLcdRefresh >= intervalLcdRefresh))
+  {
+    if (rotationCounter <= 0)
+      rotationCounter = 3;
+
+    if (rotationCounter == 1)
     {
-      for (int i = 0; i < 3; i++)
-        sensorsTemperature[i].requestTemperatures();
-      updateReadings();
+      lcd.setCursor(0, 0);
+      lcd.print(String("Druck: ") + String(ReadingsMatrix[3][0], 2) + String(" bar "));
+      lcd.setCursor(17, 0);
+      lcd.print("Now");
 
+      lcd.setCursor(0, 1);
+      lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][0], 1) + (char)223 + String("C "));
 
-      prevMillisMain = currentMillis;
-      Serial.println("Loop ended");
+      lcd.setCursor(0, 2);
+      lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][0], 1) + (char)223 + String("C "));
+
+      lcd.setCursor(0, 3);
+      lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][0], 1) + (char)223 + String("C "));
+
+      prevMillisLcdRefresh = millis();
     }
-    /*
-      // Upload readings to IoT Cloud ------------------------------------------------------------------------------
-      temperatureIn = ReadingsMatrix[0][0];
-      temperatureOut = ReadingsMatrix[1][0];
-      temperaturePool = ReadingsMatrix[2][0];
-      pressure = ReadingsMatrix[3][0];
 
-      // Show data on lcd ------------------------------------------------------------------------------------------
-      currentMillis = millis();
+    if (rotationCounter == 2)
+    {
+      lcd.setCursor(0, 0);
+      lcd.print(String("Druck: ") + String(ReadingsMatrix[3][1], 2) + String(" bar "));
+      lcd.setCursor(17, 0);
+      lcd.print("Min");
 
-      if (button.isPressed())
-      {
-        Serial.println("Button Pressed");
-        if (buttonState > 2)
-          buttonState = 0;
-        buttonState++;
-        Serial.println(buttonState);
-        lcd.backlight();
-        lcd.display();
-        // lcd.clear();
-        displayActive = 1;
-        displayOn = 0;
-        lastMillisLCDOn = currentMillis;
-      }
+      lcd.setCursor(0, 1);
+      lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][1], 1) + (char)223 + String("C "));
 
-      if (displayActive == 1 && (currentMillis - lastMillisLCDOn >= 60000))
-      {
-        Serial.println("Turned off Display");
-        lcd.noBacklight();
-        lcd.noDisplay();
-        displayActive = 0;
-        buttonState = 0;
-      }
+      lcd.setCursor(0, 2);
+      lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][1], 1) + (char)223 + String("C "));
 
-      if (displayActive)
-      {
-        if (currentMillis - prevMillisLcdRefresh >= intervalLcdRefresh)
-        {
-          if (buttonState == 1)
-          {
-            // lcd.clear();
-            lcd.setCursor(0, 0);
-            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][0], 2) + String(" bar "));
-            lcd.setCursor(17, 0);
-            lcd.print("Now");
+      lcd.setCursor(0, 3);
+      lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][1], 1) + (char)223 + String("C "));
 
-            lcd.setCursor(0, 1);
-            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][0], 1) + (char)223 + String("C "));
+      prevMillisLcdRefresh = millis();
+    }
+    if (rotationCounter == 3)
+    {
+      lcd.setCursor(0, 0);
+      lcd.print(String("Druck: ") + String(ReadingsMatrix[3][2], 2) + String(" bar "));
+      lcd.setCursor(17, 0);
+      lcd.print("Max");
+      lcd.setCursor(0, 1);
+      lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][2], 1) + (char)223 + String("C "));
 
-            lcd.setCursor(0, 2);
-            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][0], 1) + (char)223 + String("C "));
+      lcd.setCursor(0, 2);
+      lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][2], 1) + (char)223 + String("C "));
 
-            lcd.setCursor(0, 3);
-            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][0], 1) + (char)223 + String("C "));
+      lcd.setCursor(0, 3);
+      lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][2], 1) + (char)223 + String("C "));
 
-            prevMillisLcdRefresh = currentMillis;
-          }
+      prevMillisLcdRefresh = millis();
+    }
 
-          if (buttonState == 2)
-          {
-            // lcd.clear();
-            Serial.println("Page2");
-            lcd.setCursor(0, 0);
-            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][1], 2) + String(" bar "));
-            lcd.setCursor(17, 0);
-            lcd.print("Min");
-
-            lcd.setCursor(0, 1);
-            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][1], 1) + (char)223 + String("C "));
-
-            lcd.setCursor(0, 2);
-            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][1], 1) + (char)223 + String("C "));
-
-            lcd.setCursor(0, 3);
-            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][1], 1) + (char)223 + String("C "));
-
-            prevMillisLcdRefresh = currentMillis;
-          }
-          if (buttonState == 3)
-          {
-            // lcd.clear();
-            Serial.println("Page3");
-            lcd.setCursor(0, 0);
-            lcd.print(String("Druck: ") + String(ReadingsMatrix[3][2], 2) + String(" bar "));
-            lcd.setCursor(17, 0);
-            lcd.print("Max");
-            lcd.setCursor(0, 1);
-            lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][2], 1) + (char)223 + String("C "));
-
-            lcd.setCursor(0, 2);
-            lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][2], 1) + (char)223 + String("C "));
-
-            lcd.setCursor(0, 3);
-            lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][2], 1) + (char)223 + String("C "));
-
-            prevMillisLcdRefresh = currentMillis;
-          }
-        }
-      } */
-
-  if (currentMillis - prevMillisStatusOff >= intervalStatusOff && ledState == LOW)
-  {
-    // save the last time you blinked the LED
-    prevMillisStatusOn = currentMillis;
-    ledState = HIGH;
+    if (rotationCounter > 3)
+      rotationCounter = 1;
   }
 
-  if (currentMillis - prevMillisStatusOn >= intervalStatusOn && ledState == HIGH)
+  if (UpdateErrors())
   {
-    // save the last time you blinked the LED
-    prevMillisStatusOff = currentMillis;
-    ledState = LOW;
-  }
-
-  digitalWrite(pinStatusLed, ledState);
-
-  /* if (CheckErrors())
     CreateMessage();
-  Serial.print(warning); */
+    prevMillisStatusOff -= intervalStatusOff;
+    ErrorState = 1;
+    digitalWrite(pinStatusLed, HIGH);
+    Serial.println("Error occurred");
+  }
+
+  if (!ErrorState)
+  {
+    if (ArduinoCloud.connected() && intervalStatusOn != 250)
+    {
+      intervalStatusOn = 250; // interval at which to blink (milliseconds)
+      intervalStatusOff = 10000;
+    }
+    else if (!ArduinoCloud.connected() && intervalStatusOn != 500)
+    {
+      intervalStatusOn = 500; // interval at which to blink (milliseconds)
+      intervalStatusOff = 500;
+    }
+
+    if (millis() - prevMillisStatusOff >= intervalStatusOff && ledState == LOW)
+    {
+      prevMillisStatusOn = millis();
+      ledState = HIGH;
+    }
+
+    if (millis() - prevMillisStatusOn >= intervalStatusOn && ledState == HIGH)
+    {
+      prevMillisStatusOff = millis();
+      ledState = LOW;
+    }
+
+    digitalWrite(pinStatusLed, ledState);
+  }
 }
