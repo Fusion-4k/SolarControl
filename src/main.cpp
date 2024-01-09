@@ -209,7 +209,7 @@ void ResetErrors()
 {
   for (int i = 0; i < 4; i++)
   {
-    for (int k = 1; k < 3; k++)
+    for (int k = 0; k < 3; k++)
     {
       ErrorMatrix[i][k] = false;
     }
@@ -254,8 +254,8 @@ void CreateMessage()
 
 void onWarningChange()
 {
-  Serial.println("Changed Text to");
-  Serial.println(warning);
+  // Serial.println("Changed Text to");
+  // Serial.println(warning);
   if (warning == "Reset")
     ResetErrors();
 }
@@ -335,13 +335,14 @@ void setup()
   pinMode(pinRotaryCLK, INPUT);
   pinMode(pinRotaryDT, INPUT);
 
+  initReadings();
+  prevMillisTemp = millis();
+
   // Setup Arduino IoT Cloud
   initProperties();
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
   setDebugMessageLevel(2);
   ArduinoCloud.printDebugInfo();
-  initReadings();
-  prevMillisTemp = millis();
 }
 
 void loop()
@@ -361,16 +362,15 @@ void loop()
     temperaturePool = ReadingsMatrix[2][0];
     pressure = ReadingsMatrix[3][0];
     ArduinoCloud.update();
-
-    for (int i = 0; i < 4; i++)
-    {
-      for (int k = 0; k < 3; k++)
-      {
-        Serial.print(ErrorMatrix[i][k]);
-        Serial.print(" ");
-      }
-      Serial.println();
-    }
+    // for (int i = 0; i < 4; i++)
+    // {
+    //   for (int k = 0; k < 3; k++)
+    //   {
+    //     Serial.print(ErrorMatrix[i][k]);
+    //     Serial.print(" ");
+    //   }
+    //   Serial.println();
+    // }
   }
   // ====================================================================================================
 
@@ -394,6 +394,10 @@ void loop()
   }
   // ====================================================================================================
 
+  button.loop();
+  if (button.isPressed())
+    ResetErrors();
+
   // Turn off display after 60s without input
   if (TurnOnDisplay == 1 && (millis() - lastMillisLCDOn >= 60000))
   {
@@ -406,7 +410,7 @@ void loop()
   if (TurnOnDisplay && (millis() - prevMillisLcdRefresh >= intervalLcdRefresh))
   {
     if (rotationCounter <= 0)
-      rotationCounter = 3;
+      rotationCounter = 1;
 
     if (rotationCounter == 1)
     {
@@ -464,7 +468,7 @@ void loop()
     }
 
     if (rotationCounter > 3)
-      rotationCounter = 1;
+      rotationCounter = 3;
   }
 
   if (UpdateErrors())
@@ -473,20 +477,25 @@ void loop()
     prevMillisStatusOff -= intervalStatusOff;
     ErrorState = 1;
     digitalWrite(pinStatusLed, HIGH);
-    Serial.println("Error occurred");
+    // Serial.println("Error occurred");
   }
 
   if (!ErrorState)
   {
-    if (ArduinoCloud.connected() && intervalStatusOn != 250)
+    if (WiFi.status() != WL_CONNECTED && intervalStatusOn != 500)
     {
-      intervalStatusOn = 250; // interval at which to blink (milliseconds)
-      intervalStatusOff = 10000;
+      intervalStatusOn = 1000; // interval at which to blink (milliseconds)
+      intervalStatusOff = 1000;
     }
-    else if (!ArduinoCloud.connected() && intervalStatusOn != 500)
+    else if (!ArduinoCloud.connected() && intervalStatusOn != 250)
     {
       intervalStatusOn = 500; // interval at which to blink (milliseconds)
-      intervalStatusOff = 500;
+      intervalStatusOff = 1500;
+    }
+    else if (ArduinoCloud.connected() && intervalStatusOn != 250)
+    {
+      intervalStatusOn = 250; // interval at which to blink (milliseconds)
+      intervalStatusOff = 9750;
     }
 
     if (millis() - prevMillisStatusOff >= intervalStatusOff && ledState == LOW)
