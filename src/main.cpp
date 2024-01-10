@@ -431,60 +431,62 @@ void loop()
       lcd.print(LCDMessage);
 
       lcd.setCursor(0, 2);
-      if (ErrorMatrix[0][0])
+      if (ErrorMatrix[1][0])
         sprintf(LCDMessage, "Warmwasser: defekt  ");
       else
         sprintf(LCDMessage, "Warmwasser: % 5.1f %cC", ReadingsMatrix[1][0], (char)223);
       lcd.print(LCDMessage);
 
       lcd.setCursor(0, 3);
-      if (ErrorMatrix[0][0])
+      if (ErrorMatrix[2][0])
         sprintf(LCDMessage, "Poolwasser: defekt  ");
       else
         sprintf(LCDMessage, "Poolwasser: % 5.1f %cC", ReadingsMatrix[2][0], (char)223);
       lcd.print(LCDMessage);
-
-      prevMillisLcdRefresh = millis();
     }
 
     if (rotationCounter == 2)
     {
       lcd.setCursor(0, 0);
-      lcd.print(String("Druck: ") + String(ReadingsMatrix[3][1], 2) + String(" bar "));
-      lcd.setCursor(17, 0);
-      lcd.print("Min");
+      sprintf(LCDMessage, "Druck: %5.2f bar MIN", ReadingsMatrix[3][1]);
+      lcd.print(LCDMessage);
 
       lcd.setCursor(0, 1);
-      lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][1], 1) + (char)223 + String("C "));
+      sprintf(LCDMessage, "Kaltwasser: % 5.1f %cC", ReadingsMatrix[0][1], (char)223);
+      lcd.print(LCDMessage);
 
       lcd.setCursor(0, 2);
-      lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][1], 1) + (char)223 + String("C "));
+      sprintf(LCDMessage, "Warmwasser: % 5.1f %cC", ReadingsMatrix[1][1], (char)223);
+      lcd.print(LCDMessage);
 
       lcd.setCursor(0, 3);
-      lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][1], 1) + (char)223 + String("C "));
-
-      prevMillisLcdRefresh = millis();
+      sprintf(LCDMessage, "Poolwasser: % 5.1f %cC", ReadingsMatrix[2][1], (char)223);
+      lcd.print(LCDMessage);
     }
+
     if (rotationCounter == 3)
     {
       lcd.setCursor(0, 0);
-      lcd.print(String("Druck: ") + String(ReadingsMatrix[3][2], 2) + String(" bar "));
-      lcd.setCursor(17, 0);
-      lcd.print("Max");
+      sprintf(LCDMessage, "Druck: %5.2f bar MAX", ReadingsMatrix[3][2]);
+      lcd.print(LCDMessage);
+
       lcd.setCursor(0, 1);
-      lcd.print(String("Kaltwasser: ") + String(ReadingsMatrix[0][2], 1) + (char)223 + String("C "));
+      sprintf(LCDMessage, "Kaltwasser: % 5.1f %cC", ReadingsMatrix[0][2], (char)223);
+      lcd.print(LCDMessage);
 
       lcd.setCursor(0, 2);
-      lcd.print(String("Warmwasser: ") + String(ReadingsMatrix[1][2], 1) + (char)223 + String("C "));
+      sprintf(LCDMessage, "Warmwasser: % 5.1f %cC", ReadingsMatrix[1][2], (char)223);
+      lcd.print(LCDMessage);
 
       lcd.setCursor(0, 3);
-      lcd.print(String("Poolwasser: ") + String(ReadingsMatrix[2][2], 1) + (char)223 + String("C "));
-
-      prevMillisLcdRefresh = millis();
+      sprintf(LCDMessage, "Poolwasser: % 5.1f %cC", ReadingsMatrix[2][2], (char)223);
+      lcd.print(LCDMessage);
     }
 
     if (rotationCounter > 3)
       rotationCounter = 3;
+
+    prevMillisLcdRefresh = millis();
   }
 
   if (UpdateErrors())
