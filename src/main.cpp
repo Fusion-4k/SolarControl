@@ -4,19 +4,16 @@
 #include "thingProperties.h"
 #include <ezButton.h>
 #include <ESP32Encoder.h>
+#include <lcdUpdate.h>
 
 /* =================== Version Changelog ==============================================================
 
     Version 1.1
-      Seperate data pins for each temperature sensor
-      Implementing LCD screen
-      blinking status led
-      rotary encoder button interaction
-
+      Improved formatting text for the lcd
+      Status LED indicates cloud connection
+      Improved rotary encoder algorithm
    ====================================================================================================
 */
-
-char LCDMessage[21];
 
 // ==================== Settings ===================================================================
 
@@ -34,16 +31,22 @@ const int pinRotarySW = 36;
 const int pinRotaryCLK = 34;
 const int pinRotaryDT = 39;
 
-// pin for status led
-const int pinStatusLed = 27; // the number of the LED pin
+// pin for the status led
+const int pinStatusLed = 27;
 
 // =================================================================================================
 
-// Array of OneWires for TemperatureIn, TemperatureOut, TemperaturePool
+// Array of OneWire-objects for TemperatureIn, TemperatureOut, TemperaturePool
 OneWire Wires[] = {OneWire(sensorTempIn), OneWire(sensorTempOut), OneWire(sensorTempPool)};
 
-// Array of DallasTemperature sensors for TemperatureIn, TemperatureOut, TemperaturePool
+// Array of DallasTemperature-objects for sensors TemperatureIn, TemperatureOut, TemperaturePool
 DallasTemperature sensorsTemperature[] = {DallasTemperature(&Wires[0]), DallasTemperature(&Wires[1]), DallasTemperature(&Wires[2])};
+
+// Set the LCD address to 0x27 for a 20 chars and 4 line display
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Create button object
+ezButton button(pinRotarySW);
 
 // Measurements for each sensor Current/Min/Max
 float ReadingsMatrix[4][3];
@@ -55,51 +58,43 @@ float LimitMatrix[4][3] = {
     {-255, 0, 95},
     {-255, 0.5, 3.5}};
 
-// Names for each sensor; used for warning messages:  {"Sensor1", ...}
+// Name for each sensor (used to creating warning messages)
 String SensorNames[4] = {
     "Kaltwassersensor",
     "Heizwassersensor",
     "Poolwassersensor",
     "Drucksensor"};
 
-bool ErrorMatrix[4][3]; // {defect, min, max} for each sensor
+// Contains errors for each sensor defect/min/max
+bool ErrorMatrix[4][3]; //
 
+// Used for formatting the lcd text
+char LCDMessage[21];
+
+// Time required to convert temperature
+long int intervalTemp = 750 / (1 << (12 - TEMPERATURE_PRECISION));
+
+// Timer variables
+unsigned long lastMillisStatusLedOn = 0;
+unsigned long lastMillisStatusLedOff = 0;
+unsigned long lastMillisLcdRefresh = 0;
+unsigned long lastMillisTempReq = 0;
+long unsigned int lastMillisLCDOn = 0;
+
+long intervalStatusLedOn = 250;
+long intervalStatusLedOff = 10000;
+long intervalLcdRefresh = 2500;
+
+// State variables
+bool lcdOn = false;
+int lcdPageNumber = 0;
+bool ErrorState = false;
 int ledState = LOW;
-unsigned long prevMillisStatusOn = 0; // will store last time LED was updated
-unsigned long prevMillisStatusOff = 0;
-unsigned long prevMillisLcdRefresh = 0; // will store last time LED was updated
-unsigned long prevMillisMain = 0;
-unsigned long prevMillisTemp = 0;
 
-unsigned long start;
-unsigned long end;
-bool ErrorState;
-
-long intervalStatusOn = 250; // interval at which to blink (milliseconds)
-long intervalStatusOff = 10000;
-const long intervalLcdRefresh = 2500;
-const long intervalMain = 1000;
-
-// Menu skipping
-volatile int buttonState = 0;
-volatile int displayOn = 0;
+// Set to true if any data pin of the rotary encoder caused an Interrupt
 volatile bool rotaryEncoder = false;
 
-volatile long unsigned int lastMillis = 0;
-volatile long unsigned int currentMillis = 0;
-volatile long unsigned int lastMillisLCDOn = 0;
-volatile int TurnOnDisplay = 0;
-
-long int intervalTemp = 750 / (1 << (12 - TEMPERATURE_PRECISION)); // TemperatureConversionTime
-int rotationCounter = 0;
-
-LiquidCrystal_I2C lcd(0x27, 20, 4); // set the LCD address to 0x27 for a 20 chars and 4 line display
-
-ezButton button(pinRotarySW);
-
-// =================================================================================================
-
-// Interrupt routine just sets a flag when rotation is detected
+// Interrupt routine sets flag to true when a rotation is detected
 void IRAM_ATTR rotary()
 {
   rotaryEncoder = true;
@@ -126,8 +121,8 @@ float readPressureSensor(int pin)
 {
   float analogReading = analogRead(pin);
   if (analogReading < 400)
-    return -255;                                                   // set pressure to -255 if device is defect
-  float convPressure = roundFloat((analogReading - 400) / 510, 2); // 1k/2k-pcb: roundFloat((analogReading - 485) / 745, 2)
+    return -255;
+  float convPressure = roundFloat((analogReading - 400) / 510, 2);
   return convPressure;
 }
 
@@ -222,7 +217,7 @@ void ResetErrors()
 }
 
 // Creates a Warning-Message with Information for all sensors
-void CreateMessage()
+void CreateWarningMessage()
 {
   String Message = "Fehler protokolliert:\n";
   String Einheit;
@@ -306,9 +301,53 @@ int8_t checkRotaryEncoder()
   return 0;
 }
 
+// Update Status-LED
+void updateStatusLed()
+{
+  if (ErrorState && ledState != HIGH)
+  {
+    ledState = HIGH;
+  }
+  else
+  {
+    if (WiFi.status() != WL_CONNECTED && intervalStatusLedOn != 500)
+    {
+      intervalStatusLedOn = 1000; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 1000;
+    }
+    else if (!ArduinoCloud.connected() && intervalStatusLedOn != 250)
+    {
+      intervalStatusLedOn = 500; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 1500;
+    }
+    else if (ArduinoCloud.connected() && intervalStatusLedOn != 250)
+    {
+      intervalStatusLedOn = 250; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 9750;
+    }
+
+    if (millis() - lastMillisStatusLedOff >= intervalStatusLedOff && ledState == LOW)
+    {
+      lastMillisStatusLedOn = millis();
+      ledState = HIGH;
+    }
+
+    if (millis() - lastMillisStatusLedOn >= intervalStatusLedOn && ledState == HIGH)
+    {
+      lastMillisStatusLedOff = millis();
+      ledState = LOW;
+    }
+  }
+  digitalWrite(pinStatusLed, ledState);
+}
+
 void setup()
 {
   Serial.begin(115200);
+
+  pinMode(pinStatusLed, OUTPUT);
+  pinMode(pinRotaryCLK, INPUT);
+  pinMode(pinRotaryDT, INPUT);
 
   attachInterrupt(digitalPinToInterrupt(pinRotaryCLK), rotary, CHANGE);
   attachInterrupt(digitalPinToInterrupt(pinRotaryDT), rotary, CHANGE);
@@ -322,23 +361,20 @@ void setup()
     sensorsTemperature[i].requestTemperatures();
   }
 
-  // Wait for Temperature request
+  // Wait for temperature conversion
   delay(1000);
 
   // initialize the lcd display
   lcd.init();
   lcd.noBacklight();
 
-  // set debounce time for the rotay switch
-  // button.setDebounceTime(50);
+  // set debounce time for the rotay switch button
+  button.setDebounceTime(50);
 
-  // set the status led pin as output
-  pinMode(pinStatusLed, OUTPUT);
-  pinMode(pinRotaryCLK, INPUT);
-  pinMode(pinRotaryDT, INPUT);
-
+  // initialize ReadingsMatrix
   initReadings();
-  prevMillisTemp = millis();
+
+  lastMillisTempReq = millis();
 
   // Setup Arduino IoT Cloud
   initProperties();
@@ -349,72 +385,61 @@ void setup()
 
 void loop()
 {
+  ArduinoCloud.update();
+
   // Update sensor readings
-  // ====================================================================================================
-  if (millis() - prevMillisTemp >= 2500 && millis() - prevMillisTemp >= intervalTemp)
+  if (millis() - lastMillisTempReq >= intervalTemp)
   {
     updateReadings();
     for (int i = 0; i < 3; i++)
       sensorsTemperature[i].requestTemperatures();
-    prevMillisTemp = millis();
+    lastMillisTempReq = millis();
 
-    // Upload readings to IoT Cloud
+    // Update cloud variables for ArduinoIoTCloud
     temperatureIn = ReadingsMatrix[0][0];
     temperatureOut = ReadingsMatrix[1][0];
     temperaturePool = ReadingsMatrix[2][0];
     pressure = ReadingsMatrix[3][0];
-    ArduinoCloud.update();
-    // for (int i = 0; i < 4; i++)
-    // {
-    //   for (int k = 0; k < 3; k++)
-    //   {
-    //     Serial.print(ErrorMatrix[i][k]);
-    //     Serial.print(" ");
-    //   }
-    //   Serial.println();
-    // }
   }
-  // ====================================================================================================
 
   // check for rotary encoder rotation
-  // ====================================================================================================
   if (rotaryEncoder)
   {
     // Get the movement (if valid)
     int8_t rotationValue = checkRotaryEncoder();
 
-    // If valid movement, do something
+    // If valid movement, enable display
     if (rotationValue != 0)
     {
-      rotationCounter += rotationValue;
+      lcdPageNumber += rotationValue;
+      lcdOn = true;
       lcd.backlight();
       lcd.display();
-      TurnOnDisplay = 1;
       lastMillisLCDOn = millis();
-      prevMillisLcdRefresh = prevMillisLcdRefresh - intervalLcdRefresh;
+      lastMillisLcdRefresh = lastMillisLcdRefresh - intervalLcdRefresh;
     }
   }
-  // ====================================================================================================
 
+  // Check for rotary encoder button press
   button.loop();
   if (button.isPressed())
     ResetErrors();
 
   // Turn off display after 60s without input
-  if (TurnOnDisplay == 1 && (millis() - lastMillisLCDOn >= 60000))
+  if (lcdOn == 1 && (millis() - lastMillisLCDOn >= 60000))
   {
     lcd.noBacklight();
     lcd.noDisplay();
-    TurnOnDisplay = 0;
-    rotationCounter = 0;
+    lcdOn = 0;
+    lcdPageNumber = 0;
   }
 
-  if (TurnOnDisplay && (millis() - prevMillisLcdRefresh >= intervalLcdRefresh))
+  if (lcdOn && (millis() - lastMillisLcdRefresh >= intervalLcdRefresh))
   {
-    if (rotationCounter <= 0)
-      rotationCounter = 1;
+    if (lcdPageNumber <= 0)
+      lcdPageNumber = 1;
 
-    if (rotationCounter == 1)
+    if (lcdPageNumber == 1)
     {
       lcd.setCursor(0, 0);
       if (ErrorMatrix[3][0])
@@ -445,7 +470,7 @@ void loop()
       lcd.print(LCDMessage);
     }
 
-    if (rotationCounter == 2)
+    if (lcdPageNumber == 2)
     {
       lcd.setCursor(0, 0);
       sprintf(LCDMessage, "Druck: %5.2f bar MIN", ReadingsMatrix[3][1]);
@@ -464,7 +489,7 @@ void loop()
       lcd.print(LCDMessage);
     }
 
-    if (rotationCounter == 3)
+    if (lcdPageNumber == 3)
     {
       lcd.setCursor(0, 0);
       sprintf(LCDMessage, "Druck: %5.2f bar MAX", ReadingsMatrix[3][2]);
@@ -483,51 +508,53 @@ void loop()
       lcd.print(LCDMessage);
     }
 
-    if (rotationCounter > 3)
-      rotationCounter = 3;
+    if (lcdPageNumber > 3)
+      lcdPageNumber = 3;
 
-    prevMillisLcdRefresh = millis();
+    lastMillisLcdRefresh = millis();
   }
 
   if (UpdateErrors())
   {
-    CreateMessage();
-    prevMillisStatusOff -= intervalStatusOff;
+    CreateWarningMessage();
+    lastMillisStatusLedOff -= intervalStatusLedOff;
     ErrorState = 1;
-    digitalWrite(pinStatusLed, HIGH);
-    // Serial.println("Error occurred");
   }
 
-  if (!ErrorState)
+  // Update Status-LED
+  if (ErrorState && ledState != HIGH)
   {
-    if (WiFi.status() != WL_CONNECTED && intervalStatusOn != 500)
+    ledState = HIGH;
+  }
+  else
+  {
+    if (WiFi.status() != WL_CONNECTED && intervalStatusLedOn != 500)
     {
-      intervalStatusOn = 1000; // interval at which to blink (milliseconds)
-      intervalStatusOff = 1000;
+      intervalStatusLedOn = 1000; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 1000;
     }
-    else if (!ArduinoCloud.connected() && intervalStatusOn != 250)
+    else if (!ArduinoCloud.connected() && intervalStatusLedOn != 250)
     {
-      intervalStatusOn = 500; // interval at which to blink (milliseconds)
-      intervalStatusOff = 1500;
+      intervalStatusLedOn = 500; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 1500;
     }
-    else if (ArduinoCloud.connected() && intervalStatusOn != 250)
+    else if (ArduinoCloud.connected() && intervalStatusLedOn != 250)
     {
-      intervalStatusOn = 250; // interval at which to blink (milliseconds)
-      intervalStatusOff = 9750;
+      intervalStatusLedOn = 250; // interval at which to blink (milliseconds)
+      intervalStatusLedOff = 9750;
     }
 
-    if (millis() - prevMillisStatusOff >= intervalStatusOff && ledState == LOW)
+    if (millis() - lastMillisStatusLedOff >= intervalStatusLedOff && ledState == LOW)
     {
-      prevMillisStatusOn = millis();
+      lastMillisStatusLedOn = millis();
       ledState = HIGH;
     }
 
-    if (millis() - prevMillisStatusOn >= intervalStatusOn && ledState == HIGH)
+    if (millis() - lastMillisStatusLedOn >= intervalStatusLedOn && ledState == HIGH)
     {
-      prevMillisStatusOff = millis();
+      lastMillisStatusLedOff = millis();
       ledState = LOW;
     }
-
-    digitalWrite(pinStatusLed, ledState);
   }
+  digitalWrite(pinStatusLed, ledState);
 }
